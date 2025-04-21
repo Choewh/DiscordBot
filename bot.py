@@ -689,7 +689,134 @@ async def slash_update_horoscopes_command(interaction: discord.Interaction):
     else:
         await interaction.followup.send("운세 정보 업데이트 중 오류가 발생했거나 이미 진행 중입니다.", ephemeral=True)
 
-# 음악 관련 슬래시 명령어
+# --- 기존 슬래시 명령어 정의 (음악, 게임 등) ---
+
+@bot.tree.command(name="search", description="YouTube에서 음악을 검색합니다.")
+async def slash_search(interaction: discord.Interaction, query: str):
+    """YouTube에서 음악을 검색하고 선택한 곡을 재생합니다."""
+    if not interaction.user.voice:
+        await interaction.response.send_message("음성 채널에 먼저 입장해주세요!", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    try:
+        # 검색 옵션 설정
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'default_search': 'ytsearch5',  # 상위 5개 결과만 가져오기
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+            'socket_timeout': 30,
+            'retries': 5,
+            'buffersize': 16384
+        }
+
+        # 비동기로 검색 실행
+        loop = asyncio.get_event_loop()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                search_results = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{query}", download=False))
+            except Exception as e:
+                await interaction.followup.send(f"검색 중 오류가 발생했습니다: {str(e)}")
+                return
+
+        if not search_results or 'entries' not in search_results:
+            await interaction.followup.send("검색 결과를 찾을 수 없습니다.")
+            return
+
+        # 검색 결과 표시
+        embed = discord.Embed(
+            title="🎵 검색 결과",
+            description="재생할 곡의 번호를 입력해주세요 (1-5)\n취소하려면 '취소'를 입력하세요.",
+            color=discord.Color.blue()
+        )
+
+        valid_entries = [entry for entry in search_results['entries'] if entry] # None 제거
+        if not valid_entries:
+            await interaction.followup.send("유효한 검색 결과를 찾을 수 없습니다.")
+            return
+
+        for i, entry in enumerate(valid_entries, 1):
+            title = entry.get('title', '제목 없음')
+            duration = entry.get('duration')
+            url = f"https://www.youtube.com/watch?v={entry['id']}"
+            
+            duration_str = "알 수 없음"
+            if duration:
+                minutes = int(duration // 60)
+                seconds = int(duration % 60)
+                duration_str = f"{minutes}:{seconds:02d}"
+                
+            embed.add_field(
+                name=f"{i}. {title}",
+                value=f"⏱️ {duration_str}\n🔗 {url}",
+                inline=False
+            )
+
+        embed.set_footer(text="30초 안에 선택해주세요.")
+        search_msg = await interaction.followup.send(embed=embed)
+
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+
+        try:
+            msg = await bot.wait_for('message', timeout=30.0, check=check)
+            
+            if msg.content.lower() == '취소':
+                await interaction.channel.send("검색이 취소되었습니다.")
+                # defer() 후에는 followup으로 메시지 수정/삭제 불가
+                # 대신 원래 메시지를 수정하여 취소 상태 표시
+                await search_msg.edit(content="검색이 취소되었습니다.", embed=None)
+                try:
+                    await msg.delete() # 사용자 입력 메시지 삭제
+                except discord.Forbidden:
+                    pass # 권한 없을 시 무시
+                return
+
+            try:
+                choice = int(msg.content)
+                if not 1 <= choice <= len(valid_entries):
+                    await interaction.channel.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", delete_after=5)
+                    return
+            except ValueError:
+                await interaction.channel.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", delete_after=5)
+                return
+
+            selected = valid_entries[choice - 1]
+            url = f"https://www.youtube.com/watch?v={selected['id']}"
+            
+            # 검색 결과 메시지 수정하여 선택된 곡 정보 표시
+            selected_title = selected.get('title', '선택된 곡')
+            await search_msg.edit(content=f"✅ `{selected_title}` 재생 목록에 추가 중...", embed=None)
+            
+            try:
+                await msg.delete() # 사용자 입력 메시지 삭제
+            except discord.Forbidden:
+                pass
+
+            # 재생 명령어 실행 (기존 play 함수 호출 방식 유지)
+            # 직접 play 함수 호출 대신 context 생성하여 invoke
+            # Note: 이 방식은 play 함수가 @bot.command 로 정의되어 있어야 함
+            temp_ctx = await bot.get_context(interaction.message or msg) # interaction.message는 없을 수 있음
+            temp_ctx.author = interaction.user # author를 interaction 사용자로 설정
+            temp_ctx.command = bot.get_command('play') # play 명령어를 가져옴
+            if temp_ctx.command:
+                await temp_ctx.invoke(url=url) # play 명령어 실행
+                await search_msg.edit(content=f"✅ `{selected_title}` 재생 목록에 추가되었습니다.", embed=None) # 완료 메시지
+            else:
+                 await interaction.followup.send("오류: play 명령어를 찾을 수 없습니다.") # play 명령어가 없을 경우
+
+        except asyncio.TimeoutError:
+            await interaction.channel.send("시간이 초과되었습니다. 다시 시도해주세요.")
+            await search_msg.edit(content="시간 초과", embed=None)
+
+    except Exception as e:
+        await interaction.followup.send(f"오류가 발생했습니다: {str(e)}")
+
+
+# 음악 관련 슬래시 명령어 (기존 명령어를 슬래시로 호출하는 방식)
 @bot.tree.command(name="join", description="봇을 현재 음성 채널에 참여시킵니다.")
 async def slash_join(interaction: discord.Interaction):
     ctx = await commands.Context.from_interaction(interaction)
