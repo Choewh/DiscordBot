@@ -12,6 +12,12 @@ from discord import app_commands
 from datetime import timedelta, datetime
 import pytz
 
+# --- 건의함 채널 ID 저장 변수 ---
+suggestion_input_channel_id = None
+suggestion_output_channel_id = None
+suggestion_mention_role_id = None # 맨션할 역할 ID 저장
+# -----------------------------
+
 # Load environment variables
 load_dotenv()
 
@@ -347,6 +353,57 @@ class MusicPlayer:
         await self.play_next()
 
 player = MusicPlayer()
+
+async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+    """
+    명령어 사용자가 음성 채널에 있는지 확인하고,
+    봇이 해당 채널에 연결되도록 보장합니다.
+    연결 성공 시 VoiceClient 객체를, 실패 시 None을 반환합니다.
+    """
+    if not interaction.user.voice:
+        # defer 전에 응답해야 함
+        if not interaction.response.is_done():
+             await interaction.response.send_message("먼저 음성 채널에 참여해주세요.", ephemeral=True)
+        else:
+             await interaction.followup.send("먼저 음성 채널에 참여해주세요.", ephemeral=True)
+        return None
+
+    user_channel = interaction.user.voice.channel
+    voice_client = interaction.guild.voice_client
+
+    if voice_client is None:
+        try:
+            print(f"Connecting to voice channel: {user_channel.name}")
+            vc = await user_channel.connect()
+            player.voice_client = vc
+            print(f"Connected successfully.")
+            return vc
+        except Exception as e:
+            print(f"Error connecting to voice channel: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"음성 채널에 연결하는 중 오류 발생: {e}", ephemeral=True)
+            else:
+                 await interaction.followup.send(f"음성 채널에 연결하는 중 오류 발생: {e}", ephemeral=True)
+            return None
+    elif voice_client.channel != user_channel:
+        try:
+            print(f"Moving to voice channel: {user_channel.name}")
+            await voice_client.move_to(user_channel)
+            # player.voice_client는 move_to 후에도 동일 객체를 참조하므로 업데이트 불필요
+            print(f"Moved successfully.")
+            return voice_client
+        except Exception as e:
+            print(f"Error moving to voice channel: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"음성 채널 이동 중 오류 발생: {e}", ephemeral=True)
+            else:
+                 await interaction.followup.send(f"음성 채널 이동 중 오류 발생: {e}", ephemeral=True)
+            return None
+    else:
+        # 이미 올바른 채널에 연결되어 있음
+        print(f"Already in the correct voice channel: {user_channel.name}")
+        return voice_client
+
 
 class ForbiddenWordGame:
     def __init__(self):
@@ -693,23 +750,30 @@ async def slash_update_horoscopes_command(interaction: discord.Interaction):
 
 # --- 기존 슬래시 명령어 정의 (음악, 게임 등) ---
 
-@bot.tree.command(name="search", description="YouTube에서 음악을 검색합니다.")
+@bot.tree.command(name="검색", description="YouTube에서 음악을 검색합니다.")
 async def slash_search(interaction: discord.Interaction, query: str):
     """YouTube에서 음악을 검색하고 선택한 곡을 재생합니다."""
+    # defer()는 ensure_voice 전에 호출되면 안 됨 (ensure_voice에서 응답 필요할 수 있음)
+    # voice_client = await ensure_voice(interaction)
+    # if not voice_client:
+    #     return # 오류 메시지는 ensure_voice에서 처리
+
+    # 먼저 음성 채널 참여 시도
     if not interaction.user.voice:
         await interaction.response.send_message("음성 채널에 먼저 입장해주세요!", ephemeral=True)
         return
 
+    # 검색 전에 defer
     await interaction.response.defer()
 
     try:
-        # 검색 옵션 설정
-        ydl_opts = {
+        # 검색 옵션 설정 (기존 유지)
+        ydl_opts_search = {
             'format': 'bestaudio/best',
             'default_search': 'ytsearch5',  # 상위 5개 결과만 가져오기
             'quiet': True,
             'no_warnings': True,
-            'extract_flat': True,
+            'extract_flat': True, # 검색 시에는 빠르게 정보만
             'socket_timeout': 30,
             'retries': 5,
             'buffersize': 16384
@@ -717,18 +781,21 @@ async def slash_search(interaction: discord.Interaction, query: str):
 
         # 비동기로 검색 실행
         loop = asyncio.get_event_loop()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts_search) as ydl:
             try:
+                print(f"Searching YouTube for: {query}")
                 search_results = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{query}", download=False))
+                print(f"Search complete.")
             except Exception as e:
-                await interaction.followup.send(f"검색 중 오류가 발생했습니다: {str(e)}")
+                print(f"yt-dlp search error: {e}")
+                await interaction.followup.send(f"검색 중 오류가 발생했습니다: {str(e)}", ephemeral=True)
                 return
 
         if not search_results or 'entries' not in search_results:
-            await interaction.followup.send("검색 결과를 찾을 수 없습니다.")
+            await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
             return
 
-        # 검색 결과 표시
+        # 검색 결과 표시 (기존 유지)
         embed = discord.Embed(
             title="🎵 검색 결과",
             description="재생할 곡의 번호를 입력해주세요 (1-5)\n취소하려면 '취소'를 입력하세요.",
@@ -737,20 +804,20 @@ async def slash_search(interaction: discord.Interaction, query: str):
 
         valid_entries = [entry for entry in search_results['entries'] if entry] # None 제거
         if not valid_entries:
-            await interaction.followup.send("유효한 검색 결과를 찾을 수 없습니다.")
+            await interaction.followup.send("유효한 검색 결과를 찾을 수 없습니다.", ephemeral=True)
             return
 
         for i, entry in enumerate(valid_entries, 1):
             title = entry.get('title', '제목 없음')
             duration = entry.get('duration')
             url = f"https://www.youtube.com/watch?v={entry['id']}"
-            
+
             duration_str = "알 수 없음"
             if duration:
                 minutes = int(duration // 60)
                 seconds = int(duration % 60)
                 duration_str = f"{minutes}:{seconds:02d}"
-                
+
             embed.add_field(
                 name=f"{i}. {title}",
                 value=f"⏱️ {duration_str}\n🔗 {url}",
@@ -760,114 +827,344 @@ async def slash_search(interaction: discord.Interaction, query: str):
         embed.set_footer(text="30초 안에 선택해주세요.")
         search_msg = await interaction.followup.send(embed=embed)
 
+        # 사용자 선택 대기 (기존 유지)
         def check(m):
             return m.author == interaction.user and m.channel == interaction.channel
 
         try:
             msg = await bot.wait_for('message', timeout=30.0, check=check)
-            
+
             if msg.content.lower() == '취소':
-                await interaction.channel.send("검색이 취소되었습니다.")
-                # defer() 후에는 followup으로 메시지 수정/삭제 불가
-                # 대신 원래 메시지를 수정하여 취소 상태 표시
+                await msg.delete() # 사용자 메시지 삭제
                 await search_msg.edit(content="검색이 취소되었습니다.", embed=None)
-                try:
-                    await msg.delete() # 사용자 입력 메시지 삭제
-                except discord.Forbidden:
-                    pass # 권한 없을 시 무시
                 return
 
             try:
                 choice = int(msg.content)
                 if not 1 <= choice <= len(valid_entries):
-                    await interaction.channel.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", delete_after=5)
+                    await msg.delete() # 사용자 메시지 삭제
+                    await interaction.followup.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", ephemeral=True, delete_after=5)
+                    await search_msg.delete() # 검색 결과 메시지 삭제
                     return
             except ValueError:
-                await interaction.channel.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", delete_after=5)
+                await msg.delete()
+                await interaction.followup.send(f"올바른 번호를 입력해주세요 (1-{len(valid_entries)}).", ephemeral=True, delete_after=5)
+                await search_msg.delete()
                 return
 
+            await msg.delete() # 유효한 선택 후 사용자 메시지 삭제
             selected = valid_entries[choice - 1]
-            url = f"https://www.youtube.com/watch?v={selected['id']}"
-            
-            # 검색 결과 메시지 수정하여 선택된 곡 정보 표시
+            selected_url = f"https://www.youtube.com/watch?v={selected['id']}"
             selected_title = selected.get('title', '선택된 곡')
-            await search_msg.edit(content=f"✅ `{selected_title}` 재생 목록에 추가 중...", embed=None)
-            
-            try:
-                await msg.delete() # 사용자 입력 메시지 삭제
-            except discord.Forbidden:
-                pass
 
-            # 재생 명령어 실행 (기존 play 함수 호출 방식 유지)
-            # 직접 play 함수 호출 대신 context 생성하여 invoke
-            # Note: 이 방식은 play 함수가 @bot.command 로 정의되어 있어야 함
-            temp_ctx = await bot.get_context(interaction.message or msg) # interaction.message는 없을 수 있음
-            temp_ctx.author = interaction.user # author를 interaction 사용자로 설정
-            temp_ctx.command = bot.get_command('play') # play 명령어를 가져옴
-            if temp_ctx.command:
-                await temp_ctx.invoke(url=url) # play 명령어 실행
-                await search_msg.edit(content=f"✅ `{selected_title}` 재생 목록에 추가되었습니다.", embed=None) # 완료 메시지
-            else:
-                 await interaction.followup.send("오류: play 명령어를 찾을 수 없습니다.") # play 명령어가 없을 경우
+            # --- 음성 채널 참여 확인 및 연결 --- #
+            print(f"Ensuring voice connection for {interaction.user.name} after selecting '{selected_title}'")
+            voice_client = await ensure_voice(interaction)
+            if not voice_client:
+                # ensure_voice 내부에서 오류 메시지 전송됨
+                await search_msg.edit(content="음성 채널 연결 실패. 다시 시도해주세요.", embed=None)
+                return
+            print(f"Voice connection ensured/established.")
+            # --- 음성 채널 참여 확인 끝 --- #
+
+            await search_msg.edit(content=f"⏳ `{selected_title}` 정보 가져오는 중...", embed=None)
+
+            # --- 선택된 곡 정보 다시 가져오기 (스트림 URL 포함) --- #
+            ydl_opts_play = ytdl_format_options.copy()
+            ydl_opts_play['noplaylist'] = True # 확실하게 단일 곡만 처리
+            with yt_dlp.YoutubeDL(ydl_opts_play) as ydl:
+                try:
+                    print(f"Fetching full info for: {selected_url}")
+                    info = await loop.run_in_executor(None, lambda: ydl.extract_info(selected_url, download=False))
+                    print(f"Full info fetched.")
+                except Exception as e:
+                    print(f"yt-dlp play info fetch error: {e}")
+                    await search_msg.edit(content=f"오류: `{selected_title}`의 정보를 가져올 수 없습니다.", embed=None)
+                    return
+
+            stream_url = info.get('url')
+            if not stream_url:
+                 await search_msg.edit(content=f"오류: `{selected_title}`의 스트리밍 URL을 찾을 수 없습니다.", embed=None)
+                 return
+            # --- 정보 가져오기 끝 --- #
+
+            # --- 큐에 추가 및 재생 시작 --- #
+            song_data = {
+                'url': stream_url, # 실제 스트림 URL 사용
+                'title': info.get('title', selected_title),
+                'webpage_url': info.get('webpage_url', selected_url),
+                'thumbnail': info.get('thumbnail'),
+                'duration': info.get('duration'),
+                'requester': interaction.user.mention
+            }
+
+            player.queue.append(song_data)
+            print(f"Added '{song_data['title']}' to queue. Queue size: {len(player.queue)}")
+            await search_msg.edit(content=f"✅ `{song_data['title']}`을(를) 대기열에 추가했습니다.", embed=None)
+
+            if not player.is_playing:
+                print("Player not playing, starting playback.")
+                await player.play_next()
+            # --- 큐 추가 및 재생 끝 --- #
 
         except asyncio.TimeoutError:
-            await interaction.channel.send("시간이 초과되었습니다. 다시 시도해주세요.")
-            await search_msg.edit(content="시간 초과", embed=None)
+            await search_msg.edit(content="시간 초과. 다시 시도해주세요.", embed=None)
+        except Exception as e:
+             print(f"Error during song selection/processing: {e}")
+             try:
+                 # 에러 발생 시 defer된 응답 처리
+                 await interaction.followup.send(f"곡 처리 중 오류 발생: {e}", ephemeral=True)
+                 await search_msg.delete() # 오류 시 검색 메시지 삭제 시도
+             except discord.NotFound:
+                 pass # 이미 삭제되었거나 다른 오류로 찾을 수 없음
+             except Exception as inner_e:
+                 print(f"Error sending followup error message: {inner_e}")
 
     except Exception as e:
-        await interaction.followup.send(f"오류가 발생했습니다: {str(e)}")
+        print(f"Unhandled error in slash_search: {e}")
+        try:
+            # 최상위 레벨 에러 처리 (defer 후)
+            await interaction.followup.send(f"명령어 처리 중 심각한 오류 발생: {e}", ephemeral=True)
+        except Exception as final_e:
+            print(f"Failed to send final error message: {final_e}")
 
 
-# 음악 관련 슬래시 명령어 (기존 명령어를 슬래시로 호출하는 방식)
-@bot.tree.command(name="join", description="봇을 현재 음성 채널에 참여시킵니다.")
+# 음악 관련 슬래시 명령어 (직접 로직 구현 방식으로 변경)
+@bot.tree.command(name="참여", description="봇을 현재 음성 채널에 참여시킵니다.")
 async def slash_join(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await join(ctx)
+    await interaction.response.defer(ephemeral=True)
+    voice_client = await ensure_voice(interaction)
+    if voice_client:
+        await interaction.followup.send(f"{voice_client.channel.mention} 채널에 참여했습니다.")
+    # 실패 메시지는 ensure_voice에서 처리
 
-@bot.tree.command(name="forcejoin", description="봇이 다른 채널에 있어도 강제로 현재 채널로 이동시킵니다.")
+@bot.tree.command(name="강제참여", description="봇이 다른 채널에 있어도 강제로 현재 채널로 이동시킵니다.")
 async def slash_forcejoin(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await forcejoin(ctx)
+    await interaction.response.defer(ephemeral=True)
+    voice_client = await ensure_voice(interaction) # ensure_voice가 이동까지 처리
+    if voice_client:
+        await interaction.followup.send(f"{voice_client.channel.mention} 채널로 이동했습니다.")
+    # 실패 메시지는 ensure_voice에서 처리
 
-@bot.tree.command(name="play", description="YouTube 링크로 음악을 재생합니다.")
+@bot.tree.command(name="재생", description="YouTube 링크로 음악을 재생합니다.")
+@app_commands.describe(url="재생할 YouTube 영상 또는 재생목록 URL")
 async def slash_play(interaction: discord.Interaction, url: str):
-    ctx = await commands.Context.from_interaction(interaction)
-    await play(ctx, url)
+    await interaction.response.defer()
+    voice_client = await ensure_voice(interaction)
+    if not voice_client:
+        return
 
-@bot.tree.command(name="playlist", description="YouTube 플레이리스트의 곡들을 재생 목록에 추가합니다.")
+    loop = asyncio.get_event_loop()
+    try:
+        # 플레이리스트인지 단일 곡인지 확인 필요 -> yt-dlp가 처리하도록 맡김
+        # 단, 플레이리스트 처리를 위한 별도 옵션 사용 여부 결정 필요
+        is_playlist = 'list=' in url
+
+        ydl_opts_play = ytdl_format_options.copy()
+        # ydl_opts_play['noplaylist'] = not is_playlist # 자동으로 처리하도록 둘 수도 있음
+
+        print(f"Fetching info for URL: {url} (Playlist: {is_playlist})")
+        with yt_dlp.YoutubeDL(ydl_opts_play) as ydl:
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+        print(f"Info fetched for {url}")
+
+        entries_to_add = []
+        if '_type' in info and info['_type'] == 'playlist':
+            entries_to_add = info.get('entries', [])
+            playlist_title = info.get('title', '알 수 없는 플레이리스트')
+            await interaction.followup.send(f" Playlist `{playlist_title}` ({len(entries_to_add)} 곡) 정보를 가져왔습니다. 대기열에 추가 중...")
+        else:
+            entries_to_add = [info] # 단일 곡도 리스트로 처리
+
+        added_count = 0
+        for entry in entries_to_add:
+            if not entry:
+                 print("Skipping invalid entry in playlist/song.")
+                 continue
+
+            stream_url = entry.get('url')
+            if not stream_url:
+                 # 평탄화된(flat) 결과가 아니라면 보통 url 필드가 존재함
+                 # 만약 없다면 다시 시도하거나 건너뛰기
+                 print(f"Warning: No stream URL found for entry {entry.get('id') or 'N/A'}. Title: {entry.get('title', 'N/A')}")
+                 # TODO: 필요 시 extract_flat=False로 다시 정보 가져오기 시도?
+                 continue
+
+            song_data = {
+                'url': stream_url,
+                'title': entry.get('title', '제목 없음'),
+                'webpage_url': entry.get('webpage_url', url if not is_playlist else entry.get('url')), # 플레이리스트 항목 url
+                'thumbnail': entry.get('thumbnail'),
+                'duration': entry.get('duration'),
+                'requester': interaction.user.mention
+            }
+            player.queue.append(song_data)
+            added_count += 1
+
+        if added_count > 0:
+            queue_msg = f"✅ {added_count}개의 곡을 대기열에 추가했습니다."
+            if not is_playlist and added_count == 1:
+                queue_msg = f"✅ `{entries_to_add[0].get('title', '곡')}`을(를) 대기열에 추가했습니다."
+
+            # 기존 메시지가 있다면 수정, 없다면 새로 전송
+            try:
+                await interaction.edit_original_response(content=queue_msg)
+            except discord.NotFound:
+                 await interaction.followup.send(queue_msg)
+
+            if not player.is_playing:
+                print("Player not playing, starting playback after adding song(s).")
+                await player.play_next()
+        else:
+            await interaction.followup.send("⚠️ 대기열에 추가할 유효한 곡을 찾지 못했습니다.", ephemeral=True)
+
+    except yt_dlp.utils.DownloadError as e:
+         await interaction.followup.send(f"오류: URL 정보를 가져올 수 없습니다. 링크가 올바른지 확인해주세요. ({e})", ephemeral=True)
+    except Exception as e:
+        print(f"Error in slash_play: {e}")
+        try:
+            await interaction.followup.send(f"음악 재생 중 오류 발생: {e}", ephemeral=True)
+        except discord.NotFound:
+             # 이미 다른 메시지로 응답했을 수 있음
+             pass
+        except Exception as final_e:
+             print(f"Failed to send final error message in slash_play: {final_e}")
+
+
+@bot.tree.command(name="플레이리스트", description="YouTube 플레이리스트의 곡들을 재생 목록에 추가합니다.")
+@app_commands.describe(url="재생할 YouTube 플레이리스트 URL")
 async def slash_playlist(interaction: discord.Interaction, url: str):
-    ctx = await commands.Context.from_interaction(interaction)
-    await playlist(ctx, url)
+    # 실제로는 /재생 명령어가 플레이리스트 처리 로직을 포함하도록 통합함
+    # 사용성 측면에서는 별도 명령어가 더 명확할 수 있으나, 코드 중복을 줄이기 위해 통합
+    # 여기서는 /재생을 호출하도록 간단히 처리하거나, 동일 로직 복사 가능
+    await interaction.response.send_message("플레이리스트 처리는 `/재생` 명령어를 이용해주세요.", ephemeral=True)
+    # 또는:
+    # await slash_play(interaction, url) # slash_play 함수 직접 호출 (주의: defer 중복 등 문제 소지)
 
-@bot.tree.command(name="stop", description="현재 재생 중인 음악을 중지하고 재생 대기열을 비웁니다.")
+
+@bot.tree.command(name="중지", description="현재 재생 중인 음악을 중지하고 재생 대기열을 비웁니다.")
 async def slash_stop(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await stop(ctx)
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+        return
 
-@bot.tree.command(name="skip", description="현재 재생 중인 음악을 건너뜁니다.")
+    if not player.is_playing and not player.queue:
+        await interaction.response.send_message("재생 중인 곡이나 대기열이 없습니다.", ephemeral=True)
+        return
+
+    player.queue.clear()
+    player.is_playing = False # play_next 콜백 전에 상태 변경
+    player.current = None
+    voice_client.stop() # stop()이 after 콜백을 트리거할 수 있으므로 is_playing 먼저 설정
+
+    await interaction.response.send_message("⏹️ 재생을 중지하고 대기열을 비웠습니다.")
+    print(f"Playback stopped and queue cleared by {interaction.user.name}")
+
+@bot.tree.command(name="스킵", description="현재 재생 중인 음악을 건너뜁니다.")
 async def slash_skip(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await skip(ctx)
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_playing():
+        await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
+        return
 
-@bot.tree.command(name="queue", description="현재 대기열에 있는 음악 목록을 보여줍니다.")
+    # player.is_playing = False # stop() 후 after 콜백이 처리
+    voice_client.stop() # after 콜백에서 play_next 호출하여 다음 곡 재생
+    await interaction.response.send_message("⏭️ 현재 곡을 건너뛰었습니다.")
+    print(f"Song skipped by {interaction.user.name}")
+
+@bot.tree.command(name="대기열", description="현재 대기열에 있는 음악 목록을 보여줍니다.")
 async def slash_queue(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await queue(ctx)
+    if not player.queue:
+        await interaction.response.send_message("📭 대기열이 비어있습니다.", ephemeral=True)
+        return
 
-@bot.tree.command(name="nowplaying", description="현재 재생 중인 곡을 표시합니다.")
+    embed = discord.Embed(title="🎶 재생 대기열", color=discord.Color.purple())
+    queue_list = []
+    for i, song in enumerate(player.queue[:10], 1): # 최대 10개 표시
+        title = song.get('title', '제목 없음')
+        requester = song.get('requester', '알 수 없음')
+        queue_list.append(f"`{i}.` {title} (신청자: {requester})")
+
+    embed.description = "\n".join(queue_list)
+    if len(player.queue) > 10:
+        embed.set_footer(text=f"... 외 {len(player.queue) - 10} 곡")
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="현재곡", description="현재 재생 중인 곡을 표시합니다.")
 async def slash_nowplaying(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await nowplaying(ctx)
+    if not player.is_playing or not player.current:
+        await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
+        return
 
-@bot.tree.command(name="volume", description="음량을 설정합니다. (0-100)")
-async def slash_volume(interaction: discord.Interaction, volume: int = None):
-    ctx = await commands.Context.from_interaction(interaction)
-    await volume(ctx, volume)
+    song = player.current
+    embed = discord.Embed(title="▶️ 현재 재생 중", color=discord.Color.green())
+    title = song.get('title', '제목 없음')
+    url = song.get('webpage_url', 'URL 없음')
+    thumbnail = song.get('thumbnail')
+    requester = song.get('requester', '알 수 없음')
+    duration = song.get('duration')
 
-@bot.tree.command(name="leave", description="봇을 음성 채널에서 내보냅니다.")
+    embed.description = f"[{title}]({url})"
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+
+    duration_str = "알 수 없음"
+    if duration:
+        # 진행률 표시 (voice_client.source에서 현재 위치 가져오기 - 복잡할 수 있음)
+        # 우선 총 길이만 표시
+        minutes = int(duration // 60)
+        seconds = int(duration % 60)
+        duration_str = f"{minutes}:{seconds:02d}"
+
+    embed.add_field(name="길이", value=duration_str, inline=True)
+    embed.add_field(name="신청자", value=requester, inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="음량", description="음량을 설정합니다. (0-100, 기본 50)")
+@app_commands.describe(value="설정할 음량 값 (0~100)")
+async def slash_volume(interaction: discord.Interaction, value: Optional[int] = None):
+    voice_client = interaction.guild.voice_client
+
+    if value is None:
+        current_volume = int(player.volume * 100)
+        await interaction.response.send_message(f"🔊 현재 음량: {current_volume}%", ephemeral=True)
+        return
+
+    if not 0 <= value <= 100:
+        await interaction.response.send_message("음량은 0부터 100 사이의 값으로 입력해주세요.", ephemeral=True)
+        return
+
+    player.volume = value / 100.0
+    print(f"Volume set to {value}% by {interaction.user.name}")
+
+    if voice_client and voice_client.source:
+        # 현재 재생 중인 소스의 볼륨 즉시 변경
+        if isinstance(voice_client.source, discord.PCMVolumeTransformer):
+             voice_client.source.volume = player.volume
+             print("Applied volume change to current source.")
+        else:
+             print("Warning: Could not apply volume change to current source (not PCMVolumeTransformer).")
+
+    await interaction.response.send_message(f"🔊 음량을 {value}%로 설정했습니다.")
+
+@bot.tree.command(name="떠나기", description="봇을 음성 채널에서 내보냅니다.")
 async def slash_leave(interaction: discord.Interaction):
-    ctx = await commands.Context.from_interaction(interaction)
-    await leave(ctx)
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+        return
+
+    await slash_stop(interaction) # 떠나기 전에 재생 중지 및 큐 비우기
+    await voice_client.disconnect()
+    player.voice_client = None # voice_client 참조 제거
+
+    # slash_stop에서 이미 메시지를 보냈으므로 추가 응답은 불필요하거나 수정 필요
+    # await interaction.followup.send("음성 채널을 떠났습니다.") # slash_stop 응답과 충돌 가능성
+    print(f"Bot disconnected from voice channel by {interaction.user.name}")
+
 
 @bot.tree.command(name="자기소개", description="자신의 정보를 등록하고 역할을 받습니다. 특정 채널에서만 사용 가능합니다.")
 @app_commands.describe(
@@ -892,7 +1189,9 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
         return
 
     # --- 응답 지연 처리 ---
+    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] User {interaction.user.name} triggered /자기소개. Deferring...")
     await interaction.response.defer(ephemeral=False)
+    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Deferred successfully for {interaction.user.name}.")
 
     # --- 역할 찾기, 생성, 부여 (여러 역할 처리) ---
     role_names = ["자기소개 완료","Disboard"] # 부여할 역할 이름 목록
@@ -910,7 +1209,9 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
                  role_messages.append(f"    ⚠️ **생성 불가:** 봇에게 '역할 관리' 권한 부족")
             else:
                 try:
+                    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Role '{role_name}' not found for {member.name}. Attempting to create...")
                     role = await guild.create_role(name=role_name, reason=f"{role_name} 역할 자동 생성")
+                    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Role '{role_name}' created successfully for {member.name}.")
                     role_messages.append(f"    ✅ '{role_name}' 역할 생성됨.")
                     role_found_or_created = True
                 except discord.Forbidden:
@@ -943,8 +1244,10 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
     # --- 모든 역할을 한 번에 부여 --- (API 호출 줄이기)
     if roles_to_assign:
         try:
+            assigned_names = ', '.join([r.name for r in roles_to_assign]) # 로그를 위해 이름 미리 준비
+            print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Attempting to add roles [{assigned_names}] to {member.name}({member.id})...")
             await member.add_roles(*roles_to_assign, reason="자기소개 완료 (다중 역할 부여)")
-            assigned_names = ', '.join([r.name for r in roles_to_assign])
+            # assigned_names = ', '.join([r.name for r in roles_to_assign]) # 위에서 이미 정의함
             role_messages.append(f"✅ 역할 부여 시도 완료: {assigned_names}")
 
             # --- 역할 부여 성공 로그 추가 ---
@@ -953,14 +1256,57 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
             print(log_message)
             # --- 로그 추가 끝 ---
 
+            # --- 닉네임 변경 로직 추가 ---
+            new_nickname = f"{닉네임} {성별} {나이}"
+            print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Preparing to change nickname for {member.name} to '{new_nickname}'")
+            if len(new_nickname) > 32:
+                print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Warning: Generated nickname '{new_nickname}' exceeds 32 characters. It will be truncated.")
+                new_nickname = new_nickname[:32] # 32자로 자르기
+
+            can_change_nickname = True
+            if not guild.me.guild_permissions.manage_nicknames:
+                print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Nickname change failed for {member.name}: Bot lacks 'Manage Nicknames' permission.")
+                role_messages.append("닉네임 변경 실패: 봇 권한 부족")
+                can_change_nickname = False
+            elif member.top_role >= guild.me.top_role:
+                 print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Nickname change failed for {member.name}: Cannot change nickname of user with higher or equal role.")
+                 role_messages.append("닉네임 변경 실패: 대상의 역할이 봇보다 높거나 같음")
+                 can_change_nickname = False
+
+            if can_change_nickname:
+                try:
+                    await member.edit(nick=new_nickname, reason="자기소개 완료 후 닉네임 변경")
+                    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Nickname changed successfully for {member.name} to '{new_nickname}'")
+                    role_messages.append(f"✅ 닉네임 변경 완료: {new_nickname}")
+                except discord.Forbidden:
+                    error_msg = "닉네임 변경 실패: 권한 부족 (API 거부)"
+                    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Nickname change failed for {member.name}: Forbidden (likely permissions issue).")
+                    role_messages.append(error_msg)
+                except discord.HTTPException as e:
+                     error_msg = f"닉네임 변경 실패: API 오류 ({e})"
+                     print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Nickname change failed for {member.name}: HTTPException ({e})")
+                     role_messages.append(error_msg)
+                except Exception as e:
+                    error_msg = f"닉네임 변경 실패: 알 수 없는 오류 ({e})"
+                    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}]  ⚠️ Nickname change failed for {member.name}: Unknown error ({e})")
+                    role_messages.append(error_msg)
+            # --- 닉네임 변경 로직 끝 ---
+
         except discord.Forbidden:
-             role_messages.append(f"⚠️ **역할 부여 실패:** 최종 단계에서 권한 부족 확인됨.")
+             error_msg = f"⚠️ **역할 부여 실패:** 최종 단계에서 권한 부족 확인됨."
+             role_messages.append(error_msg)
+             print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Role assignment failed for {member.name}: {error_msg}")
         except discord.HTTPException as e:
-             role_messages.append(f"⚠️ **역할 부여 실패:** API 오류 ({e})")
+            error_msg = f"⚠️ **역할 부여 실패:** API 오류 ({e})"
+            role_messages.append(error_msg)
+            print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Role assignment failed for {member.name}: {error_msg}")
         except Exception as e:
-            role_messages.append(f"⚠️ **역할 부여 실패:** 알 수 없는 오류 ({e})")
+            error_msg = f"⚠️ **역할 부여 실패:** 알 수 없는 오류 ({e})"
+            role_messages.append(error_msg)
+            print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Role assignment failed for {member.name}: {error_msg}")
     elif not role_messages: # 부여할 역할도 없고 오류 메시지도 없다면
-         role_messages.append("ℹ️ 처리할 역할이 없거나 이미 모든 필수 역할을 보유하고 있습니다.")
+         info_msg = "ℹ️ 처리할 역할이 없거나 이미 모든 필수 역할을 보유하고 있습니다."
+         role_messages.append(info_msg)
 
     # --- 최종 메시지 포맷 (임베드로 변경) ---
     avatar_url = member.display_avatar.url
@@ -992,16 +1338,15 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
     embed.add_field(name="🗓️ 서버 입장일", value=joined_at_str, inline=False)
     embed.add_field(name="⏱️ 등록 시간", value=invoked_at_str, inline=False)
 
-    # 역할 부여 결과 메시지 (필요 시 주석 해제)
-    #if role_messages:
-    #    embed.add_field(name="\n--- 역할 부여 상태 ---", value="\n".join(role_messages), inline=False)
-
+    # 역할 부여 및 닉네임 변경 결과 메시지 (필요 시 주석 해제)
     embed.set_footer(text=f"요청자: {interaction.user.name}")
     embed.timestamp = discord.utils.utcnow()
 
     # ephemeral=False로 설정하여 채널에 보이게 함 (이제 followup 사용)
     try:
+        print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Preparing to send followup message for {interaction.user.name}.")
         await interaction.followup.send(embed=embed)
+        print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Followup message sent for {interaction.user.name}.")
     except Exception as e:
         print(f"자기소개 메시지 전송 실패: {e}")
         # 실패 시 사용자에게 비공개 메시지로 알림
@@ -1009,6 +1354,100 @@ async def slash_self_introduction(interaction: discord.Interaction, 닉네임: s
             await interaction.followup.send("자기소개 등록 메시지를 보내는 중 오류가 발생했습니다.", ephemeral=True)
         except: # 비공개 메시지조차 보낼 수 없는 경우
             pass
+
+
+# --- 건의함 기능 --- #
+
+@bot.tree.command(name="건의함input", description="건의사항을 입력받을 채널을 설정합니다. (관리자 전용)")
+@app_commands.describe(channel="건의사항을 입력할 채널을 선택하세요.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_suggestion_input_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    global suggestion_input_channel_id
+    suggestion_input_channel_id = channel.id
+    await interaction.response.send_message(f"✅ 건의사항 입력 채널이 {channel.mention}으로 설정되었습니다.", ephemeral=True)
+
+@bot.tree.command(name="건의함output", description="건의사항이 출력될 채널을 설정합니다. (관리자 전용)")
+@app_commands.describe(channel="건의사항이 출력될 채널을 선택하세요.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_suggestion_output_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    global suggestion_output_channel_id
+    suggestion_output_channel_id = channel.id
+    await interaction.response.send_message(f"✅ 건의사항 출력 채널이 {channel.mention}으로 설정되었습니다.", ephemeral=True)
+
+@bot.tree.command(name="건의함mentionrole", description="건의사항 알림 시 맨션할 역할을 설정합니다. (관리자 전용)")
+@app_commands.describe(role="건의사항 알림을 받을 역할을 선택하세요.")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_suggestion_mention_role(interaction: discord.Interaction, role: discord.Role):
+    """ 건의사항 알림 시 맨션할 역할을 설정합니다. """
+    global suggestion_mention_role_id
+    suggestion_mention_role_id = role.id
+    await interaction.response.send_message(f"✅ 건의사항 알림 역할이 {role.mention}으로 설정되었습니다.", ephemeral=True)
+    print(f"[{datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S KST')}] Suggestion mention role set to {role.name}({role.id}) by {interaction.user.name}")
+
+@bot.tree.command(name="건의함", description="건의사항을 작성하여 제출합니다.")
+@app_commands.describe(건의내용="전달할 건의 내용을 입력하세요.")
+async def submit_suggestion(interaction: discord.Interaction, 건의내용: str):
+    """ 사용자가 건의사항을 입력하면 설정된 출력 채널로 임베드 메시지를 전송합니다. """
+    global suggestion_input_channel_id, suggestion_output_channel_id
+    global suggestion_mention_role_id # 맨션 역할 ID 접근 추가
+
+    # 1. 채널 설정 확인
+    if not suggestion_input_channel_id or not suggestion_output_channel_id:
+        await interaction.response.send_message("⚠️ 건의함 입력 또는 출력 채널이 아직 설정되지 않았습니다. 관리자에게 문의하세요.", ephemeral=True)
+        return
+
+    # 2. 입력 채널 확인
+    if interaction.channel_id != suggestion_input_channel_id:
+        input_channel = bot.get_channel(suggestion_input_channel_id)
+        channel_mention = f"<#{suggestion_input_channel_id}>" if input_channel else f"ID: {suggestion_input_channel_id}"
+        await interaction.response.send_message(f"⚠️ 이 명령어는 {channel_mention} 채널에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    # 3. 출력 채널 가져오기
+    output_channel = bot.get_channel(suggestion_output_channel_id)
+    if not output_channel:
+        await interaction.response.send_message("⚠️ 설정된 건의사항 출력 채널을 찾을 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
+        print(f"[ERROR] Suggestion output channel with ID {suggestion_output_channel_id} not found.")
+        return
+    if not isinstance(output_channel, discord.TextChannel):
+         await interaction.response.send_message("⚠️ 설정된 건의사항 출력 채널이 텍스트 채널이 아닙니다. 관리자에게 문의하세요.", ephemeral=True)
+         print(f"[ERROR] Suggestion output channel {output_channel.name}({suggestion_output_channel_id}) is not a TextChannel.")
+         return
+
+    # 4. 임베드 메시지 생성
+    now_kst = datetime.now(pytz.timezone('Asia/Seoul'))
+    kst_time_str = now_kst.strftime("%Y년 %m월 %d일 %H:%M:%S KST")
+
+    embed = discord.Embed(
+        title="📬 새로운 건의사항",
+        color=discord.Color.blue(),
+        timestamp=now_kst # 임베드 자체 타임스탬프 (선택적)
+    )
+    embed.add_field(name="👤 작성자", value=interaction.user.mention, inline=False)
+    embed.add_field(name="⏰ 건의 시간", value=kst_time_str, inline=False)
+    embed.add_field(name="📝 내용", value=f"> {건의내용}", inline=False) # 인용구 스타일 적용
+    embed.set_footer(text=f"User ID: {interaction.user.id}")
+
+    # 5. 출력 채널로 메시지 전송
+    try:
+        mention_content = None
+        if suggestion_mention_role_id:
+            mention_content = f"<@&{suggestion_mention_role_id}>"
+
+        await output_channel.send(content=mention_content, embed=embed) # content 인자 추가
+        await interaction.response.send_message("✅ 건의사항이 성공적으로 제출되었습니다.", ephemeral=True)
+        print(f"[{kst_time_str}] Suggestion submitted by {interaction.user.name}({interaction.user.id}) in channel {interaction.channel.name}: {건의내용}")
+    except discord.Forbidden:
+        await interaction.response.send_message("⚠️ 건의사항을 출력 채널에 전송할 권한이 없습니다. 봇 권한을 확인해주세요.", ephemeral=True)
+        print(f"[ERROR] Bot lacks permission to send messages in suggestion output channel {output_channel.name}({suggestion_output_channel_id}).")
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"⚠️ 건의사항 전송 중 오류가 발생했습니다: {e}", ephemeral=True)
+        print(f"[ERROR] Failed to send suggestion to output channel {output_channel.name}({suggestion_output_channel_id}): {e}")
+    except Exception as e:
+        await interaction.response.send_message("⚠️ 건의사항 전송 중 알 수 없는 오류가 발생했습니다.", ephemeral=True)
+        print(f"[ERROR] Unknown error sending suggestion: {e}")
+
+# --- 건의함 기능 끝 --- #
 
 
 # Run the bot
