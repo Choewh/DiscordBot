@@ -9,6 +9,8 @@ from typing import List, Dict, Optional
 import requests
 from bs4 import BeautifulSoup
 from discord import app_commands
+from datetime import timedelta, datetime
+import pytz
 
 # Load environment variables
 load_dotenv()
@@ -866,6 +868,148 @@ async def slash_volume(interaction: discord.Interaction, volume: int = None):
 async def slash_leave(interaction: discord.Interaction):
     ctx = await commands.Context.from_interaction(interaction)
     await leave(ctx)
+
+@bot.tree.command(name="자기소개", description="자신의 정보를 등록하고 역할을 받습니다. 특정 채널에서만 사용 가능합니다.")
+@app_commands.describe(
+    닉네임="사용할 닉네임을 입력하세요.",
+    성별="성별을 입력하세요 (예: 남, 여, 비공개).",
+    나이="나이를 입력하세요 (예: 01, 25, 01년생, 20대).",
+    플레이_하는_게임="주로 플레이하는 게임을 입력하세요.",
+    자기소개="자신을 소개하는 간단한 메시지를 입력하세요."
+)
+async def slash_self_introduction(interaction: discord.Interaction, 닉네임: str, 성별: str, 나이: str, 플레이_하는_게임: str , 자기소개: str,):
+    """ 사용자의 자기소개를 등록하고 역할들을 부여합니다. """
+
+    member = interaction.user
+    guild = interaction.guild
+
+    if not isinstance(member, discord.Member):
+         await interaction.response.send_message("서버 멤버 정보를 가져올 수 없습니다. 서버 내에서 명령어를 실행했는지 확인해주세요.", ephemeral=True)
+         return
+
+    if not guild:
+        await interaction.response.send_message("서버 내에서만 사용할 수 있는 명령어입니다.", ephemeral=True)
+        return
+
+    # --- 응답 지연 처리 ---
+    await interaction.response.defer(ephemeral=False)
+
+    # --- 역할 찾기, 생성, 부여 (여러 역할 처리) ---
+    role_names = ["자기소개 완료","Disboard"] # 부여할 역할 이름 목록
+    roles_to_assign = []
+    role_messages = [] # 역할 관련 메시지를 저장할 리스트 (현재는 임베드에 표시 안 함)
+
+    for role_name in role_names:
+        role = discord.utils.get(guild.roles, name=role_name)
+        role_found_or_created = False
+
+        # --- 역할 찾기 또는 생성 시도 ---
+        if not role:
+            role_messages.append(f"ℹ️ '{role_name}' 역할을 찾을 수 없습니다.")
+            if not guild.me.guild_permissions.manage_roles:
+                 role_messages.append(f"    ⚠️ **생성 불가:** 봇에게 '역할 관리' 권한 부족")
+            else:
+                try:
+                    role = await guild.create_role(name=role_name, reason=f"{role_name} 역할 자동 생성")
+                    role_messages.append(f"    ✅ '{role_name}' 역할 생성됨.")
+                    role_found_or_created = True
+                except discord.Forbidden:
+                    role_messages.append(f"    ⚠️ **생성 실패:** 권한 부족")
+                except discord.HTTPException as e:
+                    role_messages.append(f"    ⚠️ **생성 실패:** API 오류 ({e})")
+                except Exception as e:
+                     role_messages.append(f"    ⚠️ **생성 실패:** 알 수 없는 오류 ({e})")
+        else:
+            role_found_or_created = True
+
+        # --- 역할 부여 시도 (역할이 존재하거나 성공적으로 생성된 경우) ---
+        if role and role_found_or_created:
+            can_assign_role = True
+            if not guild.me.guild_permissions.manage_roles:
+                 role_messages.append(f"    ⚠️ **'{role_name}' 부여 불가:** 봇에게 '역할 관리' 권한 없음")
+                 can_assign_role = False
+            elif guild.me.top_role <= role:
+                 role_messages.append(f"    ⚠️ **'{role_name}' 부여 불가:** 봇 역할 순위 낮음 ({guild.me.top_role.name} <= {role.name})")
+                 can_assign_role = False
+
+            if can_assign_role:
+                # 역할 부여 목록에 추가 (이미 가지고 있어도 괜찮음)
+                roles_to_assign.append(role)
+                if role in member.roles:
+                    role_messages.append(f"    ℹ️ '{role_name}' 역할 이미 보유 중.")
+                # else: # 부여 예정 메시지는 생략
+                #     role_messages.append(f"    ⏳ '{role_name}' 역할 부여 예정.")
+
+    # --- 모든 역할을 한 번에 부여 --- (API 호출 줄이기)
+    if roles_to_assign:
+        try:
+            await member.add_roles(*roles_to_assign, reason="자기소개 완료 (다중 역할 부여)")
+            assigned_names = ', '.join([r.name for r in roles_to_assign])
+            role_messages.append(f"✅ 역할 부여 시도 완료: {assigned_names}")
+
+            # --- 역할 부여 성공 로그 추가 ---
+            now_kst = datetime.now(pytz.timezone('Asia/Seoul')) # KST 시간 가져오기
+            log_message = f"[{now_kst.strftime('%Y-%m-%d %H:%M:%S KST')}] 역할 부여 성공: 사용자 {member.name}({member.id}) 에게 {assigned_names} 역할을 부여했습니다."
+            print(log_message)
+            # --- 로그 추가 끝 ---
+
+        except discord.Forbidden:
+             role_messages.append(f"⚠️ **역할 부여 실패:** 최종 단계에서 권한 부족 확인됨.")
+        except discord.HTTPException as e:
+             role_messages.append(f"⚠️ **역할 부여 실패:** API 오류 ({e})")
+        except Exception as e:
+            role_messages.append(f"⚠️ **역할 부여 실패:** 알 수 없는 오류 ({e})")
+    elif not role_messages: # 부여할 역할도 없고 오류 메시지도 없다면
+         role_messages.append("ℹ️ 처리할 역할이 없거나 이미 모든 필수 역할을 보유하고 있습니다.")
+
+    # --- 최종 메시지 포맷 (임베드로 변경) ---
+    avatar_url = member.display_avatar.url
+    joined_at_str = "알 수 없음"
+    if member.joined_at:
+        # UTC 시간을 KST로 변환 (UTC+9)
+        kst_joined_at = member.joined_at + timedelta(hours=9)
+        joined_at_str = kst_joined_at.strftime("%Y년 %m월 %d일 %H:%M") + " (KST)"
+
+    # 명령어 호출 시간 (KST 변환)
+    kst_invoked_at = interaction.created_at + timedelta(hours=9)
+    invoked_at_str = kst_invoked_at.strftime("%Y년 %m월 %d일 %H:%M") + " (KST)"
+
+    embed = discord.Embed(
+        title=f"📌 {member.display_name}님의 자기소개",
+        description=f"{member.mention}님의 정보가 등록되었습니다.",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=avatar_url)
+
+    # 입력된 정보 필드 추가
+    embed.add_field(name="👤 닉네임", value=닉네임, inline=True)
+    embed.add_field(name="⚧️ 성별", value=성별, inline=True)
+    embed.add_field(name="🎂 나이", value=나이, inline=True)
+    embed.add_field(name="🎮 플레이 하는 게임", value=플레이_하는_게임, inline=False)
+    embed.add_field(name="💬 한마디", value=자기소개, inline=False)
+
+    # 추가 정보 필드
+    embed.add_field(name="🗓️ 서버 입장일", value=joined_at_str, inline=False)
+    embed.add_field(name="⏱️ 등록 시간", value=invoked_at_str, inline=False)
+
+    # 역할 부여 결과 메시지 (필요 시 주석 해제)
+    #if role_messages:
+    #    embed.add_field(name="\n--- 역할 부여 상태 ---", value="\n".join(role_messages), inline=False)
+
+    embed.set_footer(text=f"요청자: {interaction.user.name}")
+    embed.timestamp = discord.utils.utcnow()
+
+    # ephemeral=False로 설정하여 채널에 보이게 함 (이제 followup 사용)
+    try:
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"자기소개 메시지 전송 실패: {e}")
+        # 실패 시 사용자에게 비공개 메시지로 알림
+        try:
+            await interaction.followup.send("자기소개 등록 메시지를 보내는 중 오류가 발생했습니다.", ephemeral=True)
+        except: # 비공개 메시지조차 보낼 수 없는 경우
+            pass
+
 
 # Run the bot
 bot.run(os.getenv('DISCORD_TOKEN')) 
