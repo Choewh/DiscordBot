@@ -405,222 +405,6 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.Voi
         return voice_client
 
 
-class ForbiddenWordGame:
-    def __init__(self):
-        self.is_active = False
-        self.forbidden_words = {}  # player_id: forbidden_word
-        self.players: List[discord.Member] = []
-        self.game_channel = None
-        self.eliminated_players: List[discord.Member] = []
-        self.message_history: Dict[int, List[str]] = {}  # user_id: [messages]
-        self.min_players = 2  # 최소 2명 이상 필요
-        self.pending_forbidden_words = {}  # player_id: target_id (누구의 금칙어를 설정해야 하는지)
-        
-    async def send(self, content: str, ephemeral: bool = False) -> None:
-        """게임 채널에 메시지를 보냅니다."""
-        if self.game_channel:
-            await self.game_channel.send(content)
-            
-    async def start_game(self, channel: discord.TextChannel) -> str:
-        if self.is_active:
-            return "이미 게임이 진행 중입니다."
-        
-        if len(self.players) < self.min_players:
-            return f"게임을 시작하려면 최소 {self.min_players}명의 참가자가 필요합니다. 현재 참가자 수: {len(self.players)}명"
-            
-        self.is_active = True
-        self.game_channel = channel
-        
-        # 각 플레이어에게 다른 플레이어의 금칙어를 설정하도록 배정
-        import random
-        player_indices = list(range(len(self.players)))
-        random.shuffle(player_indices)
-        
-        # 순환 구조로 각 플레이어에게 다른 플레이어를 배정
-        for i in range(len(self.players)):
-            target_index = (i + 1) % len(self.players)
-            self.pending_forbidden_words[self.players[i].id] = self.players[target_index].id
-        
-        # 게임 시작 안내 메시지
-        await channel.send("🎮 금칙어 게임이 시작되었습니다!")
-        
-        # 참여자가 6명 이하인 경우 채널에 임베드 메시지로 안내
-        if len(self.players) <= 6:
-            # 임베드 메시지 생성
-            embed = discord.Embed(
-                title="🎯 금칙어 설정 안내",
-                description="각 플레이어는 배정된 대상의 금칙어를 설정해주세요.",
-                color=discord.Color.blue()
-            )
-            
-            # 각 플레이어의 설정 안내 추가
-            for player in self.players:
-                target_id = self.pending_forbidden_words[player.id]
-                target = next((p for p in self.players if p.id == target_id), None)
-                if target:
-                    embed.add_field(
-                        name=f"{player.name}님의 설정",
-                        value=f"{player.mention}님, {target.name}님의 금칙어를 설정해주세요.",
-                        inline=False
-                    )
-            
-            # 설정 방법 안내 추가
-            embed.add_field(
-                name="설정 방법",
-                value="`/금칙어 단어` 형식으로 입력하세요.",
-                inline=False
-            )
-            
-            # 게임 시작 조건 안내 추가
-            embed.add_field(
-                name="게임 시작",
-                value="모든 플레이어가 금칙어를 설정하면 게임이 시작됩니다!",
-                inline=False
-            )
-            
-            # 임베드 메시지 전송
-            await channel.send(embed=embed)
-        else:
-            # 참여자가 6명 초과인 경우 DM으로 안내
-            await channel.send("참여자가 많아 각 플레이어에게 DM으로 금칙어 설정 안내를 보냅니다.")
-            
-            # 각 플레이어에게 DM으로 안내
-            for player in self.players:
-                target_id = self.pending_forbidden_words[player.id]
-                target = next((p for p in self.players if p.id == target_id), None)
-                if target:
-                    try:
-                        # DM으로 안내 메시지 전송
-                        embed = discord.Embed(
-                            title="🎯 금칙어 설정 안내",
-                            description=f"{player.name}님, {target.name}님의 금칙어를 설정해주세요.",
-                            color=discord.Color.blue()
-                        )
-                        embed.add_field(
-                            name="설정 방법",
-                            value="`/금칙어 단어` 형식으로 입력하세요.",
-                            inline=False
-                        )
-                        await player.send(embed=embed)
-                    except discord.errors.Forbidden:
-                        # DM이 차단된 경우 채널에 메시지 전송
-                        await channel.send(f"{player.mention}님, DM이 차단되어 있습니다. 채널에서 금칙어를 설정해주세요.")
-        
-        return f"금칙어 게임이 시작되었습니다! 현재 참가자: {len(self.players)}명\n각 플레이어에게 금칙어 설정 안내를 보냈습니다."
-    
-    def set_forbidden_word(self, word: str, setter: discord.Member) -> str:
-        if not self.is_active:
-            return "게임이 시작되지 않았습니다. `/시작` 명령어로 게임을 시작해주세요."
-        
-        if setter.id not in self.pending_forbidden_words:
-            return "당신은 금칙어를 설정할 차례가 아닙니다."
-            
-        target_id = self.pending_forbidden_words[setter.id]
-        target = next((p for p in self.players if p.id == target_id), None)
-        
-        if not target:
-            return "금칙어를 설정할 대상이 없습니다."
-            
-        if target.id in self.forbidden_words:
-            return f"{target.name}님의 금칙어가 이미 설정되어 있습니다."
-            
-        self.forbidden_words[target.id] = word
-        del self.pending_forbidden_words[setter.id]
-        
-        # 설정된 플레이어 수와 전체 플레이어 수 계산
-        set_count = len(self.forbidden_words)
-        total_count = len(self.players)
-        
-        # 모든 금칙어가 설정되었는지 확인
-        if not self.pending_forbidden_words:
-            asyncio.create_task(self.game_channel.send(
-                "🎉 모든 플레이어의 금칙어가 설정되었습니다!\n"
-                "이제 게임이 본격적으로 시작됩니다.\n"
-                "각자의 금칙어를 피해서 대화를 나누세요. 금칙어를 사용하면 탈락합니다!"
-            ))
-        else:
-            # 아직 설정되지 않은 플레이어 목록 생성
-            remaining_players = [p.name for p in self.players if p.id not in self.forbidden_words]
-            asyncio.create_task(self.game_channel.send(
-                f"✅ {target.name}님의 금칙어가 설정되었습니다! ({set_count}/{total_count})\n"
-                f"아직 금칙어를 설정하지 않은 플레이어: {', '.join(remaining_players)}"
-            ))
-        
-        return f"{target.name}님의 금칙어가 '{word}'로 설정되었습니다."
-    
-    def join_game(self, player: discord.Member) -> str:
-        if self.is_active:
-            return "게임이 이미 시작되었습니다. 다음 게임에 참가해주세요."
-        if player in self.players:
-            return "이미 게임에 참가하셨습니다."
-        if player in self.eliminated_players:
-            return "이미 탈락하셨습니다."
-        self.players.append(player)
-        self.message_history[player.id] = []
-        return f"{player.mention}님이 게임에 참가하셨습니다. (현재 참가자: {len(self.players)}명)"
-    
-    def check_message(self, message: discord.Message) -> Optional[str]:
-        if not self.is_active:
-            return None
-        if message.author not in self.players or message.author in self.eliminated_players:
-            return None
-            
-        content = message.content.lower()
-        # 맞춤법 교정 로직 (실제로는 더 복잡한 로직이 필요)
-        content = re.sub(r'[^\w\s]', '', content)  # 특수문자 제거
-        
-        # 해당 플레이어의 금칙어 확인
-        forbidden_word = self.forbidden_words.get(message.author.id)
-        if forbidden_word and forbidden_word.lower() in content:
-            self.eliminated_players.append(message.author)
-            self.players.remove(message.author)
-            return f"{message.author.mention}님이 금칙어 '{forbidden_word}'를 사용하여 탈락하셨습니다!"
-        return None
-    
-    def get_players(self) -> str:
-        if not self.players:
-            return "참가자가 없습니다. `/참가` 명령어로 게임에 참가해주세요."
-        
-        players_list = "\n".join([f"• {player.name}" for player in self.players])
-        eliminated_list = "\n".join([f"• {player.name}" for player in self.eliminated_players]) if self.eliminated_players else "없음"
-        
-        result = f"**참가자 목록** ({len(self.players)}명)\n{players_list}\n\n**탈락자 목록**\n{eliminated_list}"
-        
-        if self.is_active:
-            result += "\n\n**금칙어 설정 현황**"
-            for player in self.players:
-                if player.id in self.forbidden_words:
-                    result += f"\n• {player.name}: 설정됨"
-                else:
-                    result += f"\n• {player.name}: 미설정"
-        
-        return result
-    
-    def end_game(self) -> str:
-        if not self.is_active:
-            return "게임이 시작되지 않았습니다."
-        
-        winner = self.players[0] if len(self.players) == 1 else None
-        result = "게임이 종료되었습니다.\n"
-        
-        if winner:
-            result += f"승자: {winner.mention}님"
-        else:
-            result += "승자가 없습니다."
-            
-        self.is_active = False
-        self.forbidden_words = {}
-        self.players = []
-        self.eliminated_players = []
-        self.message_history = {}
-        self.game_channel = None
-        self.pending_forbidden_words = {}
-        
-        return result
-
-# 금지어 게임 인스턴스 생성
-forbidden_word_game = ForbiddenWordGame()
-
 @bot.event
 async def on_ready():
     print(f'Bot is ready! Logged in as {bot.user.name}')
@@ -1449,6 +1233,98 @@ async def submit_suggestion(interaction: discord.Interaction, 건의내용: str)
 
 # --- 건의함 기능 끝 --- #
 
+# --- 이모지 추가 명령어 ---
+ALLOWED_EMOJI_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]{2,32}$") # 디스코드 이모지 이름 규칙 (알파벳, 숫자, 밑줄만 허용, 2~32자)
+
+@bot.tree.command(name="이모지추가", description="첨부된 이미지를 서버 이모지로 등록합니다.")
+@app_commands.describe(
+    이미지="이모지로 등록할 이미지 파일을 첨부해주세요.",
+    이름="이모지의 이름을 지정합니다. (선택사항, 2~32자, 영문/숫자/_ 만 가능)"
+)
+@app_commands.checks.has_permissions(manage_emojis_and_stickers=True) # 명령어 사용자 권한 체크
+async def add_emoji(interaction: discord.Interaction, 이미지: discord.Attachment, 이름: Optional[str] = None):
+    """사용자가 첨부한 이미지를 서버 이모지로 등록하는 명령어"""
+
+    # 0. 봇 권한 확인 (이중 체크)
+    if not interaction.guild.me.guild_permissions.manage_emojis_and_stickers:
+        await interaction.response.send_message("봇에게 '이모지 및 스티커 관리' 권한이 없어 이모지를 추가할 수 없습니다.", ephemeral=True)
+        return
+
+    # 1. 이모지 이름 결정 및 유효성 검사
+    emoji_name = 이름
+    if not emoji_name:
+        # 이름이 제공되지 않으면 파일 이름 사용 (확장자 제외)
+        emoji_name = 이미지.filename.split('.')[0]
+
+    # 디스코드 규칙에 맞게 이름 정제 및 검사
+    emoji_name = re.sub(r"[^a-zA-Z0-9_]", "", emoji_name) # 허용되지 않는 문자 제거
+
+    if not ALLOWED_EMOJI_NAME_PATTERN.match(emoji_name):
+        await interaction.response.send_message(
+            f"이모지 이름 '{emoji_name}'이 유효하지 않습니다. 이름은 2~32자의 영문, 숫자, 밑줄(_)만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+        return
+
+    # 2. 이미지 데이터 읽기 시도
+    try:
+        image_bytes = await 이미지.read()
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"이미지를 읽는 중 오류가 발생했습니다: {e}", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"이미지 처리 중 예상치 못한 오류가 발생했습니다: {e}", ephemeral=True)
+        return
+
+    # 3. 이모지 생성 시도
+    await interaction.response.defer(ephemeral=True) # 처리 시간이 걸릴 수 있으므로 defer 사용
+
+    try:
+        new_emoji = await interaction.guild.create_custom_emoji(
+            name=emoji_name,
+            image=image_bytes,
+            reason=f"'{interaction.user}' 사용자가 /이모지추가 명령어로 추가"
+        )
+        await interaction.followup.send(f"성공적으로 이모지 {new_emoji} (이름: `{new_emoji.name}`)를 추가했습니다!")
+    except discord.Forbidden:
+        await interaction.followup.send("봇에게 이모지를 추가할 권한이 없습니다. 서버 관리자에게 문의하세요.")
+    except discord.HTTPException as e:
+        # HTTPException은 다양한 오류를 포함 (400 Bad Request - 이름 중복, 크기/형식 오류, 슬롯 부족 등)
+        error_message = f"이모지 추가 중 오류가 발생했습니다: {e.status} {e.text}"
+        if e.code == 30008: # Maximum number of emojis reached
+             error_message = "서버의 이모지 슬롯이 가득 찼습니다."
+        elif e.code == 50035: # Invalid Form Body (name, image data etc.)
+             if 'name' in str(e.text).lower():
+                 error_message = f"이모지 이름 '{emoji_name}'이 유효하지 않거나 이미 사용 중입니다."
+             elif 'image' in str(e.text).lower():
+                 error_message = "이미지 형식이 잘못되었거나 크기가 너무 큽니다. (256KB 이하 권장)"
+             else:
+                 error_message = "잘못된 요청입니다. 이름이나 이미지 데이터를 확인해주세요." # 일반적인 오류
+        elif e.status == 429: # Rate Limited
+            error_message = "너무 많은 요청을 보내고 있습니다. 잠시 후 다시 시도해주세요."
+
+        await interaction.followup.send(error_message)
+    except Exception as e: # 기타 예상치 못한 오류
+        await interaction.followup.send(f"이모지 추가 중 예상치 못한 오류가 발생했습니다: {e}")
+
+
+# 건의함 명령어 에러 핸들러 예시 - 필요시 이모지 명령어 에러 핸들러 추가
+@add_emoji.error
+async def add_emoji_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("이 명령어를 사용하려면 '이모지 및 스티커 관리' 권한이 필요합니다.", ephemeral=True)
+    elif isinstance(error, app_commands.BotMissingPermissions):
+         # 봇 권한 부족은 add_emoji 함수 내부에서 이미 처리하고 있지만, 핸들러에서도 잡아주는 것이 좋음
+         await interaction.response.send_message("봇에게 '이모지 및 스티커 관리' 권한이 없어 명령어를 실행할 수 없습니다.", ephemeral=True)
+    else:
+        # 이미 defer된 상태일 수 있으므로 followup 사용 고려
+        if interaction.response.is_done():
+            await interaction.followup.send(f"명령어 처리 중 오류가 발생했습니다: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"명령어 처리 중 오류가 발생했습니다: {error}", ephemeral=True)
+        print(f"Error in /이모지추가 command: {error}")
+
+# --- 이모지 추가 명령어 끝 --- #
 
 # Run the bot
 bot.run(os.getenv('DISCORD_TOKEN')) 
